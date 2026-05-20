@@ -6,6 +6,8 @@ on:
   schedule:
   - cron: "0 */6 * * *"
   workflow_dispatch:
+permissions:
+  actions: write
 env:
   ITS_IMDB_AUTH: ${{ secrets.IMDB_AUTH }}
   ITS_IMDB_EMAIL: ${{ secrets.IMDB_EMAIL }}
@@ -50,3 +52,5 @@ jobs:
       run: make build
     - name: Sync
       run: make sync
+    - name: Keepalive workflow
+      uses: gautamkrishnar/keepalive-workflow@v2
