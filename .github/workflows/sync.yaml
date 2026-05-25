@@ -53,4 +53,4 @@ jobs:
     - name: Sync
       run: make sync
     - name: Keepalive workflow
-      uses: gautamkrishnar/keepalive-workflow@v2
+      uses: liskin/gh-workflow-keepalive@v1
