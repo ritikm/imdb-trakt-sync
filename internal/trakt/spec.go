@@ -21,26 +21,17 @@ type CrudItem struct {
 }
 
 type IDMeta struct {
-	IMDb     string  `json:"imdb,omitempty"`
-	Slug     string  `json:"slug,omitempty"`
-	ListName *string `json:"-"`
+	IMDb  string `json:"imdb,omitempty"`
+	Slug  string `json:"slug,omitempty"`
+	Trakt int    `json:"trakt,omitempty"`
 }
 
 type IDMetas []IDMeta
 
-func (idms IDMetas) GetListNameFromSlug(slug string) string {
-	for _, idm := range idms {
-		if idm.Slug == slug {
-			return *idm.ListName
-		}
-	}
-	return ""
-}
-
 type Item struct {
 	Type    string    `json:"type"`
 	RatedAt string    `json:"rated_at,omitempty"`
-	Rating  int       `json:"rating,omitempty"`
+	Rating  float64   `json:"rating,omitempty"`
 	Movie   ItemSpec  `json:"movie,omitempty"`
 	Show    ItemSpec  `json:"show,omitempty"`
 	Episode ItemSpec  `json:"episode,omitempty"`
@@ -85,10 +76,10 @@ func (its Items) toListBody() listBody {
 }
 
 type ItemSpec struct {
-	IDMeta    IDMeta  `json:"ids"`
-	RatedAt   *string `json:"rated_at,omitempty"`
-	Rating    *int    `json:"rating,omitempty"`
-	WatchedAt *string `json:"watched_at,omitempty"`
+	IDMeta    IDMeta   `json:"ids"`
+	RatedAt   *string  `json:"rated_at,omitempty"`
+	Rating    *float64 `json:"rating,omitempty"`
+	WatchedAt *string  `json:"watched_at,omitempty"`
 }
 
 type ItemSpecs []ItemSpec
@@ -103,13 +94,8 @@ type List struct {
 type Lists []List
 
 type listAddBody struct {
-	Name           string `json:"name"`
-	Description    string `json:"description"`
-	Privacy        string `json:"privacy"`
-	DisplayNumbers bool   `json:"display_numbers"`
-	AllowComments  bool   `json:"allow_comments"`
-	SortBy         string `json:"sort_by"`
-	SortHow        string `json:"sort_how"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 type listBody struct {
@@ -124,6 +110,44 @@ type response struct {
 	Deleted  *CrudItem `json:"deleted,omitempty"`
 	Existing *CrudItem `json:"existing,omitempty"`
 	NotFound *listBody `json:"not_found,omitempty"`
+}
+
+// merge folds another chunk's response into r, so a bulk request that had to
+// be split into multiple chunked requests can still be logged and reasoned
+// about as a single result.
+func (r *response) merge(other response) {
+	r.Added = mergeCrudItem(r.Added, other.Added)
+	r.Deleted = mergeCrudItem(r.Deleted, other.Deleted)
+	r.Existing = mergeCrudItem(r.Existing, other.Existing)
+	r.NotFound = mergeListBody(r.NotFound, other.NotFound)
+}
+
+func mergeCrudItem(a, b *CrudItem) *CrudItem {
+	if b == nil {
+		return a
+	}
+	if a == nil {
+		a = &CrudItem{}
+	}
+	a.Movies += b.Movies
+	a.Shows += b.Shows
+	a.Episodes += b.Episodes
+	a.People += b.People
+	return a
+}
+
+func mergeListBody(a, b *listBody) *listBody {
+	if b == nil {
+		return a
+	}
+	if a == nil {
+		a = &listBody{}
+	}
+	a.Movies = append(a.Movies, b.Movies...)
+	a.Shows = append(a.Shows, b.Shows...)
+	a.Episodes = append(a.Episodes, b.Episodes...)
+	a.People = append(a.People, b.People...)
+	return a
 }
 
 type userInfo struct {

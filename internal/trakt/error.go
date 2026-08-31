@@ -2,6 +2,7 @@ package trakt
 
 import (
 	"fmt"
+	"net/http"
 )
 
 type UnexpectedStatusCodeError struct {
@@ -20,26 +21,30 @@ func NewUnexpectedStatusCodeError(got int, want ...int) error {
 	}
 }
 
-type AccountLimitExceededError struct{}
-
-func (e *AccountLimitExceededError) Error() string {
-	return "trakt account limit exceeded, more info here: https://forums.trakt.tv/t/freemium-experience-more-features-for-all-with-usage-limits/41641"
+type AccountLimitExceededError struct {
+	accountLimit string
 }
 
-func NewAccountLimitExceededError() error {
-	return &AccountLimitExceededError{}
+func (e *AccountLimitExceededError) Error() string {
+	return fmt.Sprintf("trakt account limit (%s) exceeded, more info here: https://forums.trakt.tv/t/freemium-experience-more-features-for-all-with-usage-limits/41641", e.accountLimit)
+}
+
+func NewAccountLimitExceededError(headers http.Header) error {
+	return &AccountLimitExceededError{
+		accountLimit: headers.Get("X-Account-Limit"),
+	}
 }
 
 type ListNotFoundError struct {
-	Slug string
+	ID int
 }
 
 func (e *ListNotFoundError) Error() string {
-	return fmt.Sprintf("list with slug %s could not be found", e.Slug)
+	return fmt.Sprintf("list with id %d could not be found", e.ID)
 }
 
-func NewListNotFoundError(slug string) error {
+func NewListNotFoundError(id int) error {
 	return &ListNotFoundError{
-		Slug: slug,
+		ID: id,
 	}
 }

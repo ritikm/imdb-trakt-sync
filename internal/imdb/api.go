@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 
+	"github.com/cecobask/awswaf/pkg/aws"
 	"github.com/cecobask/imdb-trakt-sync/internal/config"
 )
 
@@ -41,9 +43,14 @@ const (
 	pathSignIn    = "/registration/ap-signin-handler/imdb_us"
 	pathWatchlist = "/list/watchlist"
 
+	selectorActionsMenu        = "ul[data-testid='hero-list-subnav-actions-menu']"
+	selectorActionsMenuButton  = "button[data-testid='hero-list-subnav-actions-menu-button']"
 	selectorErrorPageTitle     = "h1[data-testid='error-page-title']"
 	selectorExportButton       = "div[data-testid='hero-list-subnav-export-button'] button"
+	selectorListHyperlink      = "a.ipc-metadata-list-summary-item__t"
+	selectorNextData           = "#__NEXT_DATA__"
 	selectorPrivateListContent = "div[data-testid='list-page-mc-private-list-content']"
+	selectorWAF                = "script[src*='token.awswaf.com']"
 )
 
 type client struct {
@@ -88,12 +95,7 @@ func NewAPI(ctx context.Context, conf *config.IMDb, logger *slog.Logger) (API, e
 	if err = browser.Connect(); err != nil {
 		return nil, fmt.Errorf("failure connecting to browser: %w", err)
 	}
-	logger.Info("launched new browser instance",
-		slog.String("url", browserURL),
-		slog.Bool("headless", *conf.Headless),
-		slog.Bool("trace", *conf.Trace),
-		slog.String("path", *conf.BrowserPath),
-	)
+	logger.Info("launched new browser instance", "url", browserURL, "headless", *conf.Headless, "trace", *conf.Trace, "path", *conf.BrowserPath)
 	c := &client{
 		baseURL: pathBase,
 		IMDb:    conf,
@@ -114,16 +116,29 @@ func (c *client) authenticateUser() error {
 		return nil
 	}
 	if *c.Auth == config.IMDbAuthMethodCookies {
-		if err := setBrowserCookies(c.browser, *c.CookieAtMain); err != nil {
-			return err
-		}
+		// Navigate first so any WAF challenge completes before setting cookies.
+		// Setting cookies before WAF can cause them to be dropped during the WAF
+		// redirect chain in non-headless mode.
 		tab, err := c.navigateAndValidateResponse(c.baseURL)
 		if err != nil {
 			return fmt.Errorf("failure navigating and validating response: %w", err)
 		}
+		if err = setBrowserCookies(c.browser, *c.CookieAtMain); err != nil {
+			return err
+		}
+		// Reload so the browser sends the now-set cookies to IMDb.
+		if err = tab.Reload(); err != nil {
+			return fmt.Errorf("failure reloading page after setting cookies: %w", err)
+		}
+		if err = tab.WaitLoad(); err != nil {
+			return fmt.Errorf("failure waiting for page to load after setting cookies: %w", err)
+		}
+		if err = c.handleWafChallenge(tab); err != nil {
+			return fmt.Errorf("failure handling waf challenge after reload: %w", err)
+		}
 		authenticated, _, err := tab.Has("#navUserMenu")
 		if err != nil {
-			return fmt.Errorf("failure finding logout div")
+			return fmt.Errorf("failure checking nav user menu: %w", err)
 		}
 		if !authenticated {
 			return fmt.Errorf("failure authenticating with the provided cookies")
@@ -180,38 +195,32 @@ func (c *client) hydrate() error {
 	if *c.Auth == config.IMDbAuthMethodNone {
 		return nil
 	}
+
 	tab, err := c.navigateAndValidateResponse(c.baseURL + pathWatchlist)
 	if err != nil {
 		return fmt.Errorf("failure navigating and validating response: %w", err)
 	}
-	hyperlink, err := tab.Element("a[data-testid='list-author-link']")
+	script, err := tab.Element(selectorNextData)
 	if err != nil {
-		return fmt.Errorf("failure finding hyperlink element: %w", err)
+		return fmt.Errorf("failure finding next data element: %w", err)
 	}
-	href, err := hyperlink.Attribute("href")
+	text, err := script.Text()
 	if err != nil {
-		return fmt.Errorf("failure extracting href from hyperlink: %w", err)
+		return fmt.Errorf("failure extracting next data text: %w", err)
 	}
-	userID, err := idExtract(*href)
-	if err != nil {
-		return fmt.Errorf("failure extracting user id from href: %w", err)
+	var nd NextData
+	if err := json.Unmarshal([]byte(text), &nd); err != nil {
+		return fmt.Errorf("failure unmarshalling next data: %w", err)
 	}
-	c.userID = userID
-	hyperlink, err = tab.Element("a[data-testid='hero-list-subnav-edit-button']")
-	if err != nil {
-		return fmt.Errorf("failure finding hyperlink element: %w", err)
+	c.userID = nd.Props.PageProps.AboveTheFoldData.AuthorProfileID
+	c.watchlistID = nd.Props.PageProps.AboveTheFoldData.ListID
+
+	if c.userID == "" || c.watchlistID == "" {
+		return fmt.Errorf("imdb user id and/or watchlist id must not be empty, the html content probably changed")
 	}
-	href, err = hyperlink.Attribute("href")
-	if err != nil {
-		return fmt.Errorf("failure extracting href from hyperlink: %w", err)
-	}
-	watchlistID, err := idExtract(*href)
-	if err != nil {
-		return fmt.Errorf("failure extracting watchlist id from href: %w", err)
-	}
-	c.watchlistID = watchlistID
+
 	lids := slices.DeleteFunc(*c.Lists, func(lid string) bool {
-		if lid == watchlistID {
+		if lid == c.watchlistID {
 			c.logger.Warn("removing watchlist id from provided lists; please use config option SYNC_WATCHLIST instead")
 			return true
 		}
@@ -224,7 +233,8 @@ func (c *client) hydrate() error {
 		}
 	}
 	c.Lists = &lids
-	c.logger.Info("hydrated imdb client", slog.String("userID", userID), slog.String("watchlistID", watchlistID), slog.Any("lists", lids))
+	c.logger.Info("hydrated imdb client", "userID", c.userID, "watchlistID", c.watchlistID, "lists", lids)
+
 	return nil
 }
 
@@ -256,20 +266,20 @@ func (c *client) ListExport(id string) error {
 	if err := c.exportResource(listURL); err != nil {
 		var urErr *UnexportableResourceError
 		if errors.As(err, &urErr) {
-			c.logger.Warn("skipping export of empty list", slog.String("id", id))
+			c.logger.Warn("skipping export of empty imdb list", "id", id)
 			*c.IgnoredLists = append(*c.IgnoredLists, id)
 			return nil
 		}
 		return fmt.Errorf("failure exporting list %s: %w", id, err)
 	}
-	c.logger.Info("exported list", slog.String("id", id))
+	c.logger.Info("exported imdb list", "id", id)
 	return nil
 }
 
 func (c *client) ListsExport(ids ...string) error {
 	for _, id := range ids {
 		if slices.Contains(*c.IgnoredLists, id) {
-			c.logger.Warn("skipping export of ignored list", slog.String("id", id))
+			c.logger.Warn("skipping export of ignored imdb list", "id", id)
 			continue
 		}
 		if err := c.ListExport(id); err != nil {
@@ -316,13 +326,13 @@ func (c *client) RatingsExport() error {
 	if err := c.exportResource(ratingsURL); err != nil {
 		var urErr *UnexportableResourceError
 		if errors.As(err, &urErr) {
-			c.logger.Warn("skipping export of empty ratings")
+			c.logger.Warn("skipping export of empty imdb ratings")
 			c.skipRatingsDownload = true
 			return nil
 		}
 		return fmt.Errorf("failure exporting ratings resource: %w", err)
 	}
-	c.logger.Info("exported ratings")
+	c.logger.Info("exported imdb ratings")
 	return nil
 }
 
@@ -354,7 +364,7 @@ func (c *client) ratingsDownload(resource *rod.Element) (Items, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failure transforming ratings data: %w", err)
 	}
-	c.logger.Info("downloaded ratings", slog.Int("count", len(items)))
+	c.logger.Info("downloaded imdb ratings", "count", len(items))
 	return items, nil
 }
 
@@ -387,7 +397,7 @@ func (c *client) listDownload(resource *rod.Element) (*List, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failure transforming list data: %w", err)
 	}
-	c.logger.Info("downloaded list", slog.String("id", lid), slog.String("name", listName), slog.Int("count", len(items)))
+	c.logger.Info("downloaded imdb list", "count", len(items), "id", lid, "name", listName)
 	return &List{
 		ListID:      lid,
 		ListName:    listName,
@@ -422,16 +432,57 @@ func (c *client) exportResource(url string) error {
 	if isForbidden := tab.MustHas(selectorPrivateListContent); isForbidden {
 		return fmt.Errorf("resource at url %s belongs to another user and/or access to it is forbidden", url)
 	}
-	isExportable, exportButton, _ := tab.Has(selectorExportButton)
-	if !isExportable {
+	// IMDb currently serves two different UI variants for the export action:
+	// a standalone button, or a button that opens an "Actions" menu
+	// containing an "Export" item. Both are checked since which one a given
+	// page load gets appears to vary.
+	hasExportButton, exportButton, _ := tab.Has(selectorExportButton)
+	if hasExportButton {
+		wait := tab.WaitRequestIdle(time.Second, []string{"pageAction=start-export"}, nil, nil)
+		if err = exportButton.Click(proto.InputMouseButtonLeft, 1); err != nil {
+			return fmt.Errorf("failure clicking on export button: %w", err)
+		}
+		wait()
+		return nil
+	}
+	hasActionsMenuButton, actionsMenuButton, _ := tab.Has(selectorActionsMenuButton)
+	if !hasActionsMenuButton {
 		return NewUnexportableResourceError(url)
 	}
+	exportMenuItem, err := c.openExportMenuItem(tab, actionsMenuButton)
+	if err != nil {
+		return fmt.Errorf("failure finding export menu item: %w", err)
+	}
 	wait := tab.WaitRequestIdle(time.Second, []string{"pageAction=start-export"}, nil, nil)
-	if err = exportButton.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return fmt.Errorf("failure clicking on export resource button: %w", err)
+	if err = exportMenuItem.Click(proto.InputMouseButtonLeft, 1); err != nil {
+		return fmt.Errorf("failure clicking on export menu item: %w", err)
 	}
 	wait()
 	return nil
+}
+
+// openExportMenuItem clicks the actions menu button and waits for the
+// "Export" menu item to appear. A single click has been observed to
+// occasionally not open the menu (likely a hydration race on a freshly
+// loaded page), so the click is retried a bounded number of times instead of
+// waiting indefinitely on one click that may never have registered.
+func (c *client) openExportMenuItem(tab *rod.Page, actionsMenuButton *rod.Element) (*rod.Element, error) {
+	const (
+		maxRetries  = 5
+		openTimeout = 5 * time.Second
+	)
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := actionsMenuButton.Click(proto.InputMouseButtonLeft, 1); err != nil {
+			return nil, fmt.Errorf("failure clicking on actions menu button: %w", err)
+		}
+		exportMenuItem, err := tab.Timeout(openTimeout).ElementR(selectorActionsMenu+" li", "Export")
+		if err == nil {
+			return exportMenuItem, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("reached max retry attempts: %w", lastErr)
 }
 
 func (c *client) waitExportsReady(tab *rod.Page, ids ...string) error {
@@ -456,15 +507,11 @@ func (c *client) waitExportsReady(tab *rod.Page, ids ...string) error {
 			}
 		}
 		if processingCount == 0 {
-			c.logger.Info("exports are ready for download", slog.Any("ids", ids), slog.Int("count", len(ids)))
+			c.logger.Info("imdb exports are ready for download", "count", len(ids), "ids", ids)
 			break
 		}
 		duration := 30 * time.Second
-		c.logger.Info(
-			"resources are still processing, reloading exports tab",
-			slog.Int("attempt", attempt),
-			slog.String("backoff", duration.String()),
-		)
+		c.logger.Info("imdb exports are still processing, reloading tab", "attempt", attempt, "backoff", duration.String())
 		time.Sleep(duration)
 		if err = tab.Reload(); err != nil {
 			return fmt.Errorf("failure reloading exports tab: %w", err)
@@ -519,31 +566,13 @@ func (c *client) lidsScrape() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failure navigating and validating response: %w", err)
 	}
-	hasLists, listCountDiv, err := tab.Has("ul[data-testid='list-page-mc-total-items'] li")
+	hyperlinks, err := c.scrollUntilStable(tab, selectorListHyperlink)
 	if err != nil {
-		return nil, fmt.Errorf("failure finding list count div: %w", err)
-	}
-	if !hasLists {
-		return make([]string, 0), nil
-	}
-	listCountText, err := listCountDiv.Text()
-	if err != nil {
-		return nil, fmt.Errorf("failure extracting list count text from div: %w", err)
-	}
-	listCountPieces := strings.Split(listCountText, " ")
-	if len(listCountPieces) != 2 {
-		return nil, fmt.Errorf("expected 2 list count text pieces, but got %d", len(listCountPieces))
-	}
-	listCount, err := strconv.Atoi(listCountPieces[0])
-	if err != nil {
-		return nil, fmt.Errorf("failure parsing list count string to integer: %w", err)
-	}
-	if err = c.scrollUntilAllElementsVisible(tab, "a.ipc-metadata-list-summary-item__t", listCount); err != nil {
 		return nil, fmt.Errorf("failure scrolling until all list elements are visible: %w", err)
 	}
-	hyperlinks, err := tab.Elements("a.ipc-metadata-list-summary-item__t")
-	if err != nil {
-		return nil, fmt.Errorf("failure finding list resource hyperlinks: %w", err)
+	if len(hyperlinks) == 0 {
+		c.logger.Warn("no imdb lists found")
+		return make([]string, 0), nil
 	}
 	lids := make([]string, len(hyperlinks))
 	for i, hyperlink := range hyperlinks {
@@ -560,25 +589,35 @@ func (c *client) lidsScrape() ([]string, error) {
 	return lids, nil
 }
 
-func (c *client) scrollUntilAllElementsVisible(tab *rod.Page, selector string, count int) error {
+// scrollUntilStable repeatedly scrolls to the last matched element and waits
+// for the tab to settle, until the number of matched elements stops growing
+// between two consecutive checks. This avoids depending on a separately
+// rendered "total items" element to know when scraping is complete; that
+// element's markup/testid has changed on IMDb's end multiple times in the
+// past, whereas the resource hyperlinks themselves have not.
+func (c *client) scrollUntilStable(tab *rod.Page, selector string) (rod.Elements, error) {
 	elements, err := tab.Elements(selector)
 	if err != nil {
-		return fmt.Errorf("failure finding elements: %w", err)
+		return nil, fmt.Errorf("failure finding elements: %w", err)
 	}
-	if err = elements.Last().ScrollIntoView(); err != nil {
-		return fmt.Errorf("failure scrolling to the last element: %w", err)
+	for {
+		count := len(elements)
+		if count > 0 {
+			if err = elements.Last().ScrollIntoView(); err != nil {
+				return nil, fmt.Errorf("failure scrolling to the last element: %w", err)
+			}
+		}
+		if err = tab.WaitStable(time.Second); err != nil {
+			return nil, fmt.Errorf("failure waiting for tab to become stable: %w", err)
+		}
+		elements, err = tab.Elements(selector)
+		if err != nil {
+			return nil, fmt.Errorf("failure finding elements: %w", err)
+		}
+		if len(elements) == count {
+			return elements, nil
+		}
 	}
-	if err = tab.WaitStable(time.Second); err != nil {
-		return fmt.Errorf("failure waiting for tab to become stable: %w", err)
-	}
-	elements, err = tab.Elements(selector)
-	if err != nil {
-		return fmt.Errorf("failure finding elements: %w", err)
-	}
-	if len(elements) < count {
-		return c.scrollUntilAllElementsVisible(tab, selector, count)
-	}
-	return nil
 }
 
 func (c *client) navigateAndValidateResponse(url string) (*rod.Page, error) {
@@ -596,7 +635,55 @@ func (c *client) navigateAndValidateResponse(url string) (*rod.Page, error) {
 	if err = tab.WaitLoad(); err != nil {
 		return nil, fmt.Errorf("failure waiting for tab %s to load: %w", url, err)
 	}
+	if err := c.handleWafChallenge(tab); err != nil {
+		return nil, fmt.Errorf("failure handling waf challenge: %w", err)
+	}
+
 	return tab, nil
+}
+
+func (c *client) handleWafChallenge(tab *rod.Page) error {
+	hasChallenge, _, err := tab.Has(selectorWAF)
+	if err != nil {
+		return fmt.Errorf("failure checking for waf selector: %w", err)
+	}
+	if !hasChallenge {
+		return nil
+	}
+	c.logger.Info("detected aws waf challenge, starting solver")
+
+	version, err := tab.Browser().Version()
+	if err != nil {
+		return fmt.Errorf("failure getting browser version: %w", err)
+	}
+	html, err := tab.HTML()
+	if err != nil {
+		return fmt.Errorf("failure getting html of tab: %w", err)
+	}
+	goku, host, err := aws.Extract(html)
+	if err != nil {
+		return fmt.Errorf("failure extracting aws waf data: %w", err)
+	}
+	waf, err := aws.NewAwsWaf(host, "imdb.com", version.UserAgent, goku, "")
+	if err != nil {
+		return fmt.Errorf("failure creating aws waf struct: %w", err)
+	}
+	token, err := waf.Run()
+	if err != nil {
+		return fmt.Errorf("failure running aws waf challenge: %w", err)
+	}
+	cookie := &proto.NetworkCookieParam{
+		Name:   "aws-waf-token",
+		Value:  token,
+		Domain: "imdb.com",
+		Path:   "/",
+	}
+	if err := c.browser.SetCookies([]*proto.NetworkCookieParam{cookie}); err != nil {
+		return fmt.Errorf("failure setting browser cookies: %w", err)
+	}
+	c.logger.Info("solved aws waf challenge")
+
+	return nil
 }
 
 func isListHyperlink(href string) bool {
@@ -695,9 +782,9 @@ func transformData(data []byte) (Items, error) {
 	}
 	if isRatingsList(header) {
 		for i, record := range records {
-			rating, err := strconv.Atoi(record[1])
+			rating, err := strconv.ParseFloat(record[1], 64)
 			if err != nil {
-				return nil, fmt.Errorf("failure parsing rating value to integer: %w", err)
+				return nil, fmt.Errorf("failure parsing rating value to float: %w", err)
 			}
 			created, err := time.Parse(time.DateOnly, record[2])
 			if err != nil {
@@ -740,7 +827,7 @@ func idExtract(href string) (string, error) {
 func buildSelector(ids ...string) string {
 	var selectors strings.Builder
 	for i, id := range ids {
-		selectors.WriteString(fmt.Sprintf(`a.ipc-metadata-list-summary-item__t[href*='%s']`, id))
+		fmt.Fprintf(&selectors, `a.ipc-metadata-list-summary-item__t[href*='%s']`, id)
 		if i != len(ids)-1 {
 			selectors.WriteString(",")
 		}
