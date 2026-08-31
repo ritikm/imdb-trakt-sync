@@ -16,26 +16,25 @@ import (
 )
 
 type IMDb struct {
-	Auth         *string   `koanf:"AUTH"`
-	Email        *string   `koanf:"EMAIL"`
-	Password     *string   `koanf:"PASSWORD"`
-	CookieAtMain *string   `koanf:"COOKIEATMAIN"`
-	Lists        *[]string `koanf:"LISTS"`
-	IgnoredLists *[]string `koanf:"IGNOREDLISTS"`
-	Trace        *bool     `koanf:"TRACE"`
-	Headless     *bool     `koanf:"HEADLESS"`
-	BrowserPath  *string   `koanf:"BROWSERPATH"`
+	Auth         *IMDbAuthMethod `koanf:"AUTH"`
+	Email        *string         `koanf:"EMAIL"`
+	Password     *string         `koanf:"PASSWORD"`
+	CookieAtMain *string         `koanf:"COOKIEATMAIN"`
+	Lists        *[]string       `koanf:"LISTS"`
+	IgnoredLists *[]string       `koanf:"IGNOREDLISTS"`
+	Trace        *bool           `koanf:"TRACE"`
+	Headless     *bool           `koanf:"HEADLESS"`
+	BrowserPath  *string         `koanf:"BROWSERPATH"`
 }
 
 type Trakt struct {
-	Email        *string `koanf:"EMAIL"`
-	Password     *string `koanf:"PASSWORD"`
 	ClientID     *string `koanf:"CLIENTID"`
 	ClientSecret *string `koanf:"CLIENTSECRET"`
+	TokenFile    *string `koanf:"TOKENFILE"`
 }
 
 type Sync struct {
-	Mode      *string        `koanf:"MODE"`
+	Mode      *SyncMode      `koanf:"MODE"`
 	History   *bool          `koanf:"HISTORY"`
 	Ratings   *bool          `koanf:"RATINGS"`
 	Watchlist *bool          `koanf:"WATCHLIST"`
@@ -54,14 +53,18 @@ const (
 	delimiter = "_"
 	prefix    = "ITS" + delimiter
 
-	IMDbAuthMethodCredentials = "credentials"
-	IMDbAuthMethodCookies     = "cookies"
-	IMDbAuthMethodNone        = "none"
-	SyncModeAddOnly           = "add-only"
-	SyncModeDryRun            = "dry-run"
-	SyncModeFull              = "full"
-	SyncTimeoutDefault        = time.Minute * 15
+	IMDbAuthMethodCredentials IMDbAuthMethod = "credentials"
+	IMDbAuthMethodCookies     IMDbAuthMethod = "cookies"
+	IMDbAuthMethodNone        IMDbAuthMethod = "none"
+	SyncModeAddOnly           SyncMode       = "add-only"
+	SyncModeDryRun            SyncMode       = "dry-run"
+	SyncModeFull              SyncMode       = "full"
+	SyncTimeoutDefault                       = time.Minute * 15
 )
+
+type IMDbAuthMethod string
+
+type SyncMode string
 
 func New(path string, includeEnv bool) (*Config, error) {
 	k := koanf.New(delimiter)
@@ -102,7 +105,7 @@ func NewFromMap(data map[string]interface{}) (*Config, error) {
 }
 
 func (c *Config) Validate() error {
-	if isNilOrEmpty(c.IMDb.Auth) {
+	if c.IMDb.Auth == nil || *c.IMDb.Auth == "" {
 		return fmt.Errorf("field 'IMDB_AUTH' is required")
 	}
 	switch *c.IMDb.Auth {
@@ -127,22 +130,16 @@ func (c *Config) Validate() error {
 	if err := c.validateListIdentifiers(*c.IMDb.IgnoredLists); err != nil {
 		return fmt.Errorf("field 'IMDB_IGNOREDLISTS' is invalid: %w", err)
 	}
-	if isNilOrEmpty(c.Trakt.Email) {
-		return fmt.Errorf("field 'TRAKT_EMAIL' is required")
-	}
-	if isNilOrEmpty(c.Trakt.Password) {
-		return fmt.Errorf("field 'TRAKT_PASSWORD' is required")
-	}
 	if isNilOrEmpty(c.Trakt.ClientID) {
 		return fmt.Errorf("field 'TRAKT_CLIENTID' is required")
 	}
 	if isNilOrEmpty(c.Trakt.ClientSecret) {
 		return fmt.Errorf("field 'TRAKT_CLIENTSECRET' is required")
 	}
-	if isNilOrEmpty(c.Sync.Mode) {
+	if c.Sync.Mode == nil || *c.Sync.Mode == "" {
 		return fmt.Errorf("field 'SYNC_MODE' is required")
 	}
-	if !slices.Contains(validSyncModes(), *c.Sync.Mode) {
+	if !slices.Contains(validSyncModes(), string(*c.Sync.Mode)) {
 		return fmt.Errorf("field 'SYNC_MODE' must be one of: %s", strings.Join(validSyncModes(), ", "))
 	}
 	return c.checkDummies()
@@ -210,6 +207,9 @@ func (c *Config) applyDefaults() {
 	if c.IMDb.BrowserPath == nil {
 		c.IMDb.BrowserPath = pointer("")
 	}
+	if c.Trakt.TokenFile == nil || *c.Trakt.TokenFile == "" {
+		c.Trakt.TokenFile = pointer("trakt-token.json")
+	}
 	if c.Sync.Mode == nil {
 		c.Sync.Mode = pointer(SyncModeDryRun)
 	}
@@ -236,17 +236,17 @@ func pointer[T any](v T) *T {
 
 func validSyncModes() []string {
 	return []string{
-		SyncModeFull,
-		SyncModeAddOnly,
-		SyncModeDryRun,
+		string(SyncModeFull),
+		string(SyncModeAddOnly),
+		string(SyncModeDryRun),
 	}
 }
 
 func validIMDbAuthMethods() []string {
 	return []string{
-		IMDbAuthMethodCredentials,
-		IMDbAuthMethodCookies,
-		IMDbAuthMethodNone,
+		string(IMDbAuthMethodCredentials),
+		string(IMDbAuthMethodCookies),
+		string(IMDbAuthMethodNone),
 	}
 }
 
@@ -270,10 +270,17 @@ func environmentVariableModifier(key string, value string) (string, any) {
 	if value == "" {
 		return key, nil
 	}
-	if strings.Contains(value, ",") {
+	if slices.Contains(sliceFields(), key) && strings.Contains(value, ",") {
 		return key, strings.Split(value, ",")
 	}
 	return key, value
+}
+
+func sliceFields() []string {
+	return []string{
+		"IMDB_LISTS",
+		"IMDB_IGNOREDLISTS",
+	}
 }
 
 func isNilOrEmpty(value *string) bool {

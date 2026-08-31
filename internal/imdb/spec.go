@@ -18,7 +18,7 @@ type Item struct {
 	ID      string
 	Kind    string
 	Created time.Time
-	Rating  *int
+	Rating  *float64
 }
 
 func (it *Item) ToTraktItem() trakt.Item {
@@ -69,3 +69,21 @@ type List struct {
 }
 
 type Lists []List
+
+type NextData struct {
+	Props Props `json:"props"`
+}
+
+type Props struct {
+	PageProps PageProps `json:"pageProps"`
+}
+
+type PageProps struct {
+	AboveTheFoldData AboveTheFoldData `json:"aboveTheFoldData"`
+}
+
+type AboveTheFoldData struct {
+	AuthorID        string `json:"authorId"`
+	AuthorProfileID string `json:"authorProfileId"`
+	ListID          string `json:"listId"`
+}
